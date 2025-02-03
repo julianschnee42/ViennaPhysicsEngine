@@ -15,6 +15,13 @@ set(CMAKE_CONFIGURATION_TYPES "Debug;Release")
 #set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 #set(CMAKE_CXX_CLANG_TIDY clang-tidy -checks=readability-*;cppcoreguidelines-*;-header-filter=.*; -p build)
 
+# Todo: Make this a bit more clean, don't just manually add VECS dependancies
+set(EXTERN ${PROJECT_SOURCE_DIR}/extern)
+set (VECS ${EXTERN}/ViennaEntityComponentSystem)
+include_directories (${VECS}/include)
+include_directories (${VECS}/extern/ViennaTypeListLibrary/include)
+include_directories (${VECS}/extern/ViennaStrongType/include)
+
 add_subdirectory(examples)
 
 if (${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_CURRENT_SOURCE_DIR})

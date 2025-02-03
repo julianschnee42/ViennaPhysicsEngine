@@ -31,6 +31,8 @@
 #include "glm/gtx/quaternion.hpp"
 #include "glm/gtx/matrix_cross_product.hpp"
 
+#include "VECS.h"
+
 
 //If DOUBLE_ACCURACY is defined then computations are done with double accuracy. 
 //If SINGLE_ACCURACY is defined then use single accuracy

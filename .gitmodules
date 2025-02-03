@@ -1,0 +1,3 @@
+[submodule "extern/ViennaEntityComponentSystem"]
+	path = extern/ViennaEntityComponentSystem
+	url = git@github.com:hlavacs/ViennaEntityComponentSystem.git
