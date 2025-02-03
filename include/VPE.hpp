@@ -188,6 +188,7 @@ namespace std {
 //P...point
 //V...vector
 //N...normal vector
+/*
 #define ITORP(X) glmvec3{contact.m_body_inc.m_to_other * glmvec4{X, 1.0_real}}
 #define ITORV(X) glmmat3{contact.m_body_inc.m_to_other} * (X)
 #define ITORN(X) contact.m_body_inc.m_to_other_it * (X)
@@ -209,7 +210,7 @@ namespace std {
 
 #define RTTORP(X) glmvec3{face_ref->m_TtoL * glmvec4{(X), 1.0_real}}
 #define RTTOWP(X) glmvec3{contact.m_body_ref.m_body->m_model * face_ref->m_TtoL * glmvec4{(X), 1.0_real}}
-
+*/
 
 //-------------------------------------------------------------------------------------------------------------
 
@@ -430,6 +431,9 @@ namespace vpe {
 		class Body {
 
 		public:
+			static inline uint32_t body_id_counter = 0; // Counter to assign each new body a unique ID. Always increment this in a constructor!
+
+			uint32_t m_id;
 			VPEWorld* m_physics;			//Pointer to the physics world to access parameters
 			std::string	m_name;							//The name of this body
 
@@ -476,7 +480,7 @@ namespace vpe {
 			/// Constructor of class Body. Uses ony default parameters.
 			/// </summary>
 			/// <param name="physics">Pointer to the physics world.</param>
-			Body(VPEWorld* physics) : m_physics{ physics } { m_polytope = &m_physics->g_cube; inertiaTensorL(); updateMatrices(); };
+			Body(VPEWorld* physics) : m_physics{ physics }, m_id{ Body::body_id_counter++ } { m_polytope = &m_physics->g_cube; inertiaTensorL(); updateMatrices(); };
 
 			/// <summary>
 			/// Constructor of class Body
@@ -502,7 +506,7 @@ namespace vpe {
 				m_physics{ physics }, m_name{ name }, m_owner{ owner }, m_polytope{ polytope },
 				m_scale{ scale }, m_positionW{ positionW }, m_orientationLW{ orientationLW },
 				m_linear_velocityW{ linear_velocityW }, m_angular_velocityW{ angular_velocityW },
-				m_mass_inv{ mass_inv }, m_restitution{ restitution }, m_friction{ friction } {
+				m_mass_inv{ mass_inv }, m_restitution{ restitution }, m_friction{ friction }, m_id{ Body::body_id_counter++ } {
 					m_scale *= m_physics->m_collision_margin_factor;
 					inertiaTensorL();
 					updateMatrices();
@@ -662,6 +666,212 @@ namespace vpe {
 			};
 		};
 
+		// Todo:  Write test cases with original macros!
+
+		struct TransformSpace {
+			// First entry is reference body, second one is incident
+			std::array<std::shared_ptr<Body>, 2> m_bodies;
+			std::array<glmmat4, 2> m_matrices;
+			std::array<glmmat3, 2> m_matrices_it;
+
+			TransformSpace(std::shared_ptr<Body> ref, std::shared_ptr<Body> inc) : m_bodies{ {ref, inc} } {
+				updateMatrices(0); // We always want to compute values here, thus we pass 0 as a loop value
+			}
+
+			enum tf_space_t {
+				reference			= 1,
+				incident			= 2,
+				world				= 4,
+				tangent				= 8,
+				incident_tangent	= incident | tangent,
+				reference_tangent	= reference | tangent
+			};
+ 
+			void updateMatrices(const uint64_t& current_loop) {
+				// Only update matrices if one of the involved bodies have changed position/orientation, i.e. if they were active in the previous loop
+				if (m_bodies[0]->m_loop_last_active + 1 >= current_loop || m_bodies[1]->m_loop_last_active + 1 >= current_loop) {
+					m_matrices[0] = m_bodies[1]->m_model_inv * m_bodies[0]->m_model; //transform to bring space A to space B
+					m_matrices_it[0] = glm::transpose(glm::inverse(glmmat3{ m_matrices[0]}));	//transform for a normal vector
+					m_matrices[1] = m_bodies[0]->m_model_inv * m_bodies[1]->m_model; //transform to bring space B to space A
+					m_matrices_it[1] = glm::transpose(glm::inverse(glmmat3{ m_matrices[1]}));	//transform for a normal vector
+				}
+			}
+
+			glmvec3 point_transform(const glmvec4& p, tf_space_t from, tf_space_t to) const {
+				// Converting into the same space makes no sense here
+				assert(from != to);
+
+				if (from & tf_space_t::world) {
+					// Remove tangent flag if it's set
+					return m_bodies[(to & (~tf_space_t::tangent)) - 1]->m_model_inv * p;
+				}
+				else if (to & tf_space_t::world) {
+					return m_bodies[(from & (~tf_space_t::tangent)) - 1]->m_model * p;
+				}
+				else {
+					return m_matrices[(from & (~tf_space_t::tangent)) - 1] * p;
+				}
+			}
+
+			glmvec3 point_transform(const glmvec3& p, tf_space_t from, tf_space_t to) const {
+				return point_transform(glmvec4{ p, 1.0_real }, from, to);
+			}
+
+			glmvec3 vector_transform(const glmvec3& v, tf_space_t from, tf_space_t to) const {
+				return point_transform(glmvec4{v, 0.0_real}, from, to );
+			}
+
+			// Todo:: Include this in above or remove tangent flag
+			glmvec3 normal_transform(const glmvec3& n, tf_space_t from, tf_space_t to) const {
+				if (from & tf_space_t::world) {
+					return glmmat3{ m_bodies[static_cast<int>(to) - 1]->m_model_inv } * n;
+				}
+				else if (to & tf_space_t::world) {
+					return glmmat3{ m_bodies[static_cast<int>(from) - 1]->m_model_it } * n;
+				}
+				else {
+					return glmmat3{ m_matrices_it[static_cast<int>(from) - 1] } * n;
+				}
+			}
+
+			glmvec3 point_tangent_transform(const glmvec3& p, Face* face_ref, Face* face_incident, tf_space_t from, tf_space_t to) const {
+				// Tangent space can't be combined with world space
+				assert(!((from & tf_space_t::tangent) && (from & tf_space_t::world)) && !((to & tf_space_t::tangent) && (to & tf_space_t::world)));
+				// Converting into the same space makes no sense
+				assert(from != to);
+
+				glmvec4 _p{ p, 1.0_real };
+				// Move point out of tangent space if requested
+				if (from & tf_space_t::tangent) {
+					_p = ((from & tf_space_t::reference) ? face_ref : face_incident)->m_TtoL * _p;
+
+					// Check if origin space without tangent is the same as target space, in that case we are done
+					if (from - tf_space_t::tangent == to) return _p;
+				}
+
+				// Perform usual transformation 
+				_p = glmvec4{ point_transform(_p, from, to), 1.0_real };
+
+				// Move to target tangent space if needed
+				if (to & tf_space_t::tangent) {
+					_p = ((to & tf_space_t::reference) ? face_ref : face_incident)->m_LtoT * _p;
+				}
+
+				return _p;
+			}
+
+			void cmp(glmvec3 v1, glmvec3 v2, std::string pr) const {
+				if (!glm::all(glm::epsilonEqual(v1, v2, 0.0001f))) {
+					
+					//std::cout << "Error " << pr << ":" << m_body_ref.m_body->m_id << " and " << m_body_inc.m_body->m_id << "\n";
+					//m_body_ref.m_body->m_physics->m_mode = VPEWorld::SIMULATION_MODE_DEBUG;
+				}
+			}
+
+			void swapBodies() {
+				std::swap(m_bodies[0], m_bodies[1]);
+				std::swap(m_matrices[0], m_matrices[1]);
+				std::swap(m_matrices_it[0], m_matrices_it[1]);
+			}
+
+			/*
+			glmvec3 incident_to_ref_point(const glmvec3& v) const {
+				auto test = this->point_transform(v, TransformSpace::incident, TransformSpace::reference);
+				cmp(test, glmvec3{ m_body_inc.m_to_other * glmvec4{v, 1.0_real} }, "1");
+				return glmvec3{ m_body_inc.m_to_other * glmvec4{v, 1.0_real} };
+			}
+
+			glmvec3 incident_to_ref_vec(const glmvec3& v) const {
+				auto test = this->vector_transform(v, TransformSpace::incident, TransformSpace::reference);
+				cmp(test, glmmat3{ m_body_inc.m_to_other } *v, "2");
+				return glmmat3{ m_body_inc.m_to_other } * v;
+			}
+
+			glmvec3 incident_to_ref_normal(const glmvec3& v) const {
+				auto test = this->normal_transform(v, TransformSpace::incident, TransformSpace::reference);
+				cmp(test, m_body_inc.m_to_other_it * v, "3");
+				return m_body_inc.m_to_other_it * v;
+			}
+
+			glmvec3 incident_to_ref_tangent_point(const glmvec3& v, Face* face) const {
+				auto test = this->point_tangent_transform(v, face, nullptr, TransformSpace::incident, TransformSpace::reference_tangent);
+				cmp(test, glmvec3{ face->m_LtoT * m_body_inc.m_to_other * glmvec4{v, 1.0_real} }, "13");
+				return glmvec3{ face->m_LtoT * m_body_inc.m_to_other * glmvec4{v, 1.0_real} };
+			}
+
+			glmvec3 incident_tangent_to_world_point(const glmvec3& v, Face* face) const {
+				auto test = this->point_tangent_transform(v, nullptr, face, TransformSpace::incident_tangent, TransformSpace::world);
+				cmp(test, glmvec3{ m_body_inc.m_body->m_model * face->m_TtoL * glmvec4{ v, 1.0_real } }, "4");
+				return glmvec3{ m_body_inc.m_body->m_model * face->m_TtoL * glmvec4{ v, 1.0_real } };
+			}
+
+			glmvec3 incident_to_world_point(const glmvec3& v) const {
+				auto test = this->point_transform(v, TransformSpace::incident, TransformSpace::world);
+				cmp(test, glmvec3{ m_body_inc.m_body->m_model * glmvec4{v, 1.0_real} }, "5");
+				return glmvec3{ m_body_inc.m_body->m_model * glmvec4{v, 1.0_real} };
+			}
+
+			glmvec3 incident_to_world_normal(const glmvec3& v) const {
+				auto test = this->normal_transform(v, TransformSpace::incident, TransformSpace::world);
+				cmp(test, m_body_inc.m_body->m_model_it * v, "6");
+				return m_body_inc.m_body->m_model_it * v;
+			}
+
+			glmvec3 ref_to_incident_point(const glmvec3& v) const {
+				auto test = this->point_transform(v, TransformSpace::reference, TransformSpace::incident);
+				cmp(test, glmvec3{ m_body_ref.m_to_other * glmvec4{v, 1.0_real} }, "16");
+				return glmvec3{ m_body_ref.m_to_other * glmvec4{v, 1.0_real} };
+			}
+
+			glmvec3 ref_to_incident_normal(const glmvec3& v) const {
+				auto test = this->normal_transform(v, TransformSpace::reference, TransformSpace::incident);
+				cmp(test, m_body_ref.m_to_other_it * v, "26");
+				return m_body_ref.m_to_other_it * v;
+			}
+
+			glmvec3 ref_to_world_point(const glmvec3& v) const {
+				auto test = this->point_transform(v, TransformSpace::reference, TransformSpace::world);
+				cmp(test, glmvec3{ m_body_ref.m_body->m_model * glmvec4{v, 1.0_real} }, "7");
+				return glmvec3{ m_body_ref.m_body->m_model * glmvec4{v, 1.0_real} };
+			}
+
+			glmvec3 ref_to_world_normal(const glmvec3& v) const {
+				auto test = this->normal_transform(v, TransformSpace::reference, TransformSpace::world);
+				cmp(test, m_body_ref.m_body->m_model_it * v, "46");
+				return m_body_ref.m_body->m_model_it * v;
+			}
+
+			glmvec3 ref_to_ref_tangent_point(const glmvec3& v, const glmmat4& face_LtoT) const {
+				return glmvec3{ face_LtoT * glmvec4{v, 1.0_real} };
+			}
+
+			glmvec3 world_to_incident_tangent_point(const glmvec3& v, Face* face) const {
+				auto test = this->point_tangent_transform(v, nullptr, face, TransformSpace::world, TransformSpace::incident_tangent);
+				cmp(test, glmvec3{ face->m_LtoT * m_body_inc.m_body->m_model_inv * glmvec4{v, 1.0_real} }, "8");
+				return glmvec3{ face->m_LtoT * m_body_inc.m_body->m_model_inv * glmvec4{v, 1.0_real} };
+			}
+
+			glmvec3 world_to_ref_normal(const glmvec3& v) const {
+				auto test = this->normal_transform(v, TransformSpace::world, TransformSpace::reference);
+				cmp(test, glmmat3{ m_body_ref.m_body->m_model_inv } *v, "9");
+				return glmmat3{ m_body_ref.m_body->m_model_inv } * v;
+			}
+
+			glmvec3 world_to_incident_normal(const glmvec3& v) const {
+				return glmmat3{ m_body_inc.m_body->m_model_inv } *v;
+			}
+
+			glmvec3 ref_tangent_to_ref_point(const glmvec3& v, const glmmat4& face_TtoL) const {
+				return glmvec3{ face_TtoL * glmvec4{v, 1.0_real} };
+			}
+
+			glmvec3 ref_tangent_to_world_point(const glmvec3& v, Face* face) const {
+				auto test = this->point_tangent_transform(v, face, nullptr, TransformSpace::reference_tangent, TransformSpace::world);
+				cmp(test, glmvec3{ m_body_ref.m_body->m_model * face->m_TtoL * glmvec4{v, 1.0_real} }, "10");
+				return glmvec3{ m_body_ref.m_body->m_model * face->m_TtoL * glmvec4{v, 1.0_real} };
+			}*/
+		};
+
 		//--------------------------------------------------------------------------------------------------
 		//Contact between bodies
 
@@ -670,17 +880,6 @@ namespace vpe {
 		/// This struct holds the contact information between a pair of bodies.
 		/// </summary>
 		struct Contact {
-
-			/// <summary>
-			/// A generalize pointer to a body, also including transforms. Used to be able to quickly
-			/// swap the meaning of two bodies (reference and incident body)
-			/// </summary>
-			struct BodyPtr {
-				std::shared_ptr<Body> m_body;	//pointer to body
-				glmmat4 m_to_other;				//transform to other body
-				glmmat3 m_to_other_it;			//inverse transpose of transform to other body, for normal vectors
-			};
-
 			/// <summary>
 			/// A single point of contact between two bodies.
 			/// </summary>
@@ -710,8 +909,10 @@ namespace vpe {
 			};
 
 			uint64_t	m_last_loop{ std::numeric_limits<uint64_t>::max() }; //number of last loop this contact was valid
-			BodyPtr		m_body_ref;							//reference body, we will use its local space mostly
-			BodyPtr		m_body_inc;							//incident body, we will transfer its points/vectors to the ref space
+			std::shared_ptr<Body>		m_body_ref;							//reference body, we will use its local space mostly
+			std::shared_ptr<Body>		m_body_inc;							//incident body, we will transfer its points/vectors to the ref space
+			TransformSpace m_tfSpace;
+
 			uint64_t	m_num_resting{ 0 };					//Number of resting contacts
 			bool		m_active{ true };					//if deactive, the contact is ignored
 			glmvec3		m_separating_axisW{ 0 };			//Axis that separates the two bodies in world space
@@ -721,7 +922,14 @@ namespace vpe {
 
 			std::vector<ContactPoint> m_contact_points{};		//Contact points in contact manifold in world space
 			std::vector<ContactPoint> m_old_contact_points{};	//Contact points in contact manifold in world space in prev loop
+
+			void swapBodies() {
+				std::swap(m_body_ref, m_body_inc);
+				m_tfSpace.swapBodies();
+			}
 		};
+
+
 
 		/// <summary>
 		/// This function adds a new contact point to a contact manifold. 
@@ -735,9 +943,9 @@ namespace vpe {
 				geometry::computeBasis(normalW, contact.m_tangentW[0], contact.m_tangentW[1]);	//Calculate a tangent base
 				contact.m_num_resting = 0;
 			}
-			auto r0W = positionW - contact.m_body_ref.m_body->m_positionW;	//Position relative to body 0 center in world coordinates
-			auto r1W = positionW - contact.m_body_inc.m_body->m_positionW;	//Position relative to body 1 center in world coordinates
-			auto vrel = contact.m_body_inc.m_body->totalVelocityW(positionW) - contact.m_body_ref.m_body->totalVelocityW(positionW);
+			auto r0W = positionW - contact.m_body_ref->m_positionW;	//Position relative to body 0 center in world coordinates
+			auto r1W = positionW - contact.m_body_inc->m_positionW;	//Position relative to body 1 center in world coordinates
+			auto vrel = contact.m_body_inc->totalVelocityW(positionW) - contact.m_body_ref->totalVelocityW(positionW);
 			auto d = glm::dot(vrel, normalW);
 
 			Contact::ContactPoint::type_t type;	//determine the contact point type
@@ -747,8 +955,8 @@ namespace vpe {
 			}
 			else if (d > m_resting_factor * c_gravity * m_sim_delta_time) {	//Resting contact
 				type = Contact::ContactPoint::type_t::resting;
-				contact.m_body_ref.m_body->m_num_resting++;
-				contact.m_body_inc.m_body->m_num_resting++;
+				contact.m_body_ref->m_num_resting++;
+				contact.m_body_inc->m_num_resting++;
 				contact.m_num_resting++;
 				vbias = (penetration < 0.0_real) ? m_bias * (real)m_sim_frequency * std::max(0.0_real, -penetration - m_slop) : 0.0_real;
 			}
@@ -756,15 +964,15 @@ namespace vpe {
 				type = Contact::ContactPoint::type_t::colliding;			//Colliding contact
 			}
 
-			auto restitution = std::max(contact.m_body_ref.m_body->m_restitution, contact.m_body_inc.m_body->m_restitution);
+			auto restitution = std::max(contact.m_body_ref->m_restitution, contact.m_body_inc->m_restitution);
 			restitution = (type == Contact::ContactPoint::type_t::colliding ? restitution : 0.0_real);
-			auto friction = (contact.m_body_ref.m_body->m_friction + contact.m_body_inc.m_body->m_friction) / 2.0_real;
+			auto friction = (contact.m_body_ref->m_friction + contact.m_body_inc->m_friction) / 2.0_real;
 
 			auto mc0 = matrixCross3(r0W);	//Turn cross product into a matrix multiplication
 			auto mc1 = matrixCross3(r1W);
 
-			auto K = glmmat3{ 1.0_real } *contact.m_body_inc.m_body->m_mass_inv - mc1 * contact.m_body_inc.m_body->m_inertia_invW * mc1 + //mass matrix
-				glmmat3{ 1.0_real } *contact.m_body_ref.m_body->m_mass_inv - mc0 * contact.m_body_ref.m_body->m_inertia_invW * mc0;
+			auto K = glmmat3{ 1.0_real } *contact.m_body_inc->m_mass_inv - mc1 * contact.m_body_inc->m_inertia_invW * mc1 + //mass matrix
+				glmmat3{ 1.0_real } *contact.m_body_ref->m_mass_inv - mc0 * contact.m_body_ref->m_inertia_invW * mc0;
 
 			auto K_inv = glm::inverse(K);	//Inverse of mass matrix (roughly 1/mass)
 
@@ -1087,11 +1295,13 @@ namespace vpe {
 		/// <param name="contact">Contact information..</param>
 		void positionBias(real query_separation, real face_separation, glmvec3 normalL, Contact& contact) {
 			if (query_separation < m_collision_margin) {
-				real weight = 1.0_real / (1.0_real + contact.m_body_inc.m_body->mass() * contact.m_body_ref.m_body->m_mass_inv);
-				auto pbias = -RTOWN(normalL) * (-query_separation) * (real)m_sim_frequency * (1.0_real - weight);
-				addPositionBias(contact.m_body_ref.m_body->m_pbias, pbias);
-				pbias = RTOWN(normalL) * (-query_separation) * (real)m_sim_frequency * weight;
-				addPositionBias(contact.m_body_inc.m_body->m_pbias, pbias);
+				real weight = 1.0_real / (1.0_real + contact.m_body_inc->mass() * contact.m_body_ref->m_mass_inv);
+				//auto pbias = -contact.m_tfSpace.ref_to_world_normal(normalL) * (-query_separation) * (real)m_sim_frequency * (1.0_real - weight);
+				auto pbias = -contact.m_tfSpace.normal_transform(normalL, TransformSpace::reference, TransformSpace::world) * (-query_separation) * (real)m_sim_frequency * (1.0_real - weight);
+				addPositionBias(contact.m_body_ref->m_pbias, pbias);
+				//pbias = contact.m_tfSpace.ref_to_world_normal(normalL) * (-query_separation) * (real)m_sim_frequency * weight;
+				pbias = contact.m_tfSpace.normal_transform(normalL, TransformSpace::reference, TransformSpace::world) * (-query_separation) * (real)m_sim_frequency * weight;
+				addPositionBias(contact.m_body_inc->m_pbias, pbias);
 			}
 		}
 
@@ -1176,7 +1386,8 @@ namespace vpe {
 						auto it = m_contacts.find({ coll.second->m_owner, neigh.second->m_owner }); //if contact exists already
 						if (it != m_contacts.end()) { it->second.m_last_loop = m_loop; }			// yes - update loop count
 						else {
-							m_contacts.insert({ { coll.second->m_owner, neigh.second->m_owner }, {m_loop, {coll.second}, {neigh.second} } }); //no - make new
+							m_contacts.insert({ { coll.second->m_owner, neigh.second->m_owner }, {m_loop, {coll.second}, {neigh.second}, { {coll.second}, {neigh.second} } } }); //no - make new
+						//	std::cout << "Creating contact between " << coll.second->m_id << " and " << neigh.second->m_id << "\n";
 						}
 					}
 				}
@@ -1218,18 +1429,18 @@ namespace vpe {
 
 					if (!warmStartContact(contact)) {	//Can we completely warm start the contact?
 						bool ct = false;
-						if (contact.m_body_ref.m_body->m_owner == nullptr) {
+						if (contact.m_body_ref->m_owner == nullptr) {
 							ct = groundTest(contact);		//is the ref body the ground?
 						}
 						else {
-							glmvec3 diff = contact.m_body_inc.m_body->m_positionW - contact.m_body_ref.m_body->m_positionW;
-							real rsum = contact.m_body_ref.m_body->boundingSphereRadius() + contact.m_body_inc.m_body->boundingSphereRadius();
+							glmvec3 diff = contact.m_body_inc->m_positionW - contact.m_body_ref->m_positionW;
+							real rsum = contact.m_body_ref->boundingSphereRadius() + contact.m_body_inc->boundingSphereRadius();
 							if (glm::dot(diff, diff) > rsum * rsum) { ++it;  continue; }
 							ct = SAT(it->second);						//yes - test it
 						}
 						if (ct) {
-							if (m_collider.contains(contact.m_body_ref.m_body->m_owner)) m_collider[contact.m_body_ref.m_body->m_owner](contact.m_body_ref.m_body, contact.m_body_inc.m_body);
-							if (m_collider.contains(contact.m_body_inc.m_body->m_owner)) m_collider[contact.m_body_inc.m_body->m_owner](contact.m_body_inc.m_body, contact.m_body_ref.m_body);
+							if (m_collider.contains(contact.m_body_ref->m_owner)) m_collider[contact.m_body_ref->m_owner](contact.m_body_ref, contact.m_body_inc);
+							if (m_collider.contains(contact.m_body_inc->m_owner)) m_collider[contact.m_body_inc->m_owner](contact.m_body_inc, contact.m_body_ref);
 						}
 					}
 					++it;
@@ -1246,8 +1457,8 @@ namespace vpe {
 		/// <returns></returns>
 		bool warmStartContact(Contact& contact) {
 			if (m_use_warmstart_single == 0
-				|| contact.m_body_ref.m_body->m_loop_last_active + 2 > m_loop		//do not set to 1
-				|| contact.m_body_inc.m_body->m_loop_last_active + 2 > m_loop
+				|| contact.m_body_ref->m_loop_last_active + 2 > m_loop		//do not set to 1
+				|| contact.m_body_inc->m_loop_last_active + 2 > m_loop
 				|| contact.m_old_contact_points.size() < 3
 				|| contact.m_num_resting != contact.m_old_contact_points.size()) {	//do not warmstart if non resting contact points present
 				return false;
@@ -1255,15 +1466,15 @@ namespace vpe {
 
 			for (auto& cp : contact.m_old_contact_points) {
 				auto F = cp.m_f * contact.m_normalW;
-				contact.m_body_ref.m_body->m_linear_velocityW += -F * contact.m_body_ref.m_body->m_mass_inv;
-				contact.m_body_ref.m_body->m_angular_velocityW += contact.m_body_ref.m_body->m_inertia_invW * glm::cross(cp.m_r0W, -F);
-				contact.m_body_inc.m_body->m_linear_velocityW += F * contact.m_body_inc.m_body->m_mass_inv;
-				contact.m_body_inc.m_body->m_angular_velocityW += contact.m_body_inc.m_body->m_inertia_invW * glm::cross(cp.m_r1W, F);
+				contact.m_body_ref->m_linear_velocityW += -F * contact.m_body_ref->m_mass_inv;
+				contact.m_body_ref->m_angular_velocityW += contact.m_body_ref->m_inertia_invW * glm::cross(cp.m_r0W, -F);
+				contact.m_body_inc->m_linear_velocityW += F * contact.m_body_inc->m_mass_inv;
+				contact.m_body_inc->m_angular_velocityW += contact.m_body_inc->m_inertia_invW * glm::cross(cp.m_r1W, F);
 			}
 			contact.m_contact_points = std::move(contact.m_old_contact_points);	//reuse previous contact points.
 
-			contact.m_body_ref.m_body->m_loop_last_active = 0;		//immediately wake up bodies
-			contact.m_body_inc.m_body->m_loop_last_active = 0;
+			contact.m_body_ref->m_loop_last_active = 0;		//immediately wake up bodies
+			contact.m_body_inc->m_loop_last_active = 0;
 
 			return true;
 		}
@@ -1278,8 +1489,8 @@ namespace vpe {
 			int num_old_points{ 0 };
 			for (auto& c : m_contacts) {
 				auto& contact = c.second;
-				auto num0 = contact.m_body_ref.m_body->m_num_resting;
-				auto num1 = contact.m_body_inc.m_body->m_num_resting;
+				auto num0 = contact.m_body_ref->m_num_resting;
+				auto num1 = contact.m_body_inc->m_num_resting;
 
 				if (num0 < 4 || num1 < 4 || contact.m_contact_points.size() == 0 || contact.m_old_contact_points.size() == 0) continue;
 
@@ -1291,10 +1502,10 @@ namespace vpe {
 							cp.m_f = coldp.m_f;		//remember old normal force
 
 							auto F = cp.m_f * contact.m_normalW;
-							contact.m_body_ref.m_body->m_linear_velocityW += -F * contact.m_body_ref.m_body->m_mass_inv;
-							contact.m_body_ref.m_body->m_angular_velocityW += contact.m_body_ref.m_body->m_inertia_invW * glm::cross(cp.m_r0W, -F);
-							contact.m_body_inc.m_body->m_linear_velocityW += F * contact.m_body_inc.m_body->m_mass_inv;
-							contact.m_body_inc.m_body->m_angular_velocityW += contact.m_body_inc.m_body->m_inertia_invW * glm::cross(cp.m_r1W, F);
+							contact.m_body_ref->m_linear_velocityW += -F * contact.m_body_ref->m_mass_inv;
+							contact.m_body_ref->m_angular_velocityW += contact.m_body_ref->m_inertia_invW * glm::cross(cp.m_r0W, -F);
+							contact.m_body_inc->m_linear_velocityW += F * contact.m_body_inc->m_mass_inv;
+							contact.m_body_inc->m_angular_velocityW += contact.m_body_inc->m_inertia_invW * glm::cross(cp.m_r1W, F);
 						}
 					}
 				}
@@ -1307,11 +1518,12 @@ namespace vpe {
 		/// </summary>
 		/// <param name="contact">The contact information between the ground and the body.</param>
 		bool groundTest(Contact& contact) {
-			if (contact.m_body_inc.m_body->m_positionW.y > contact.m_body_inc.m_body->boundingSphereRadius()) return false; //early out test
+			if (contact.m_body_inc->m_positionW.y > contact.m_body_inc->boundingSphereRadius()) return false; //early out test
 			real min_depth{ std::numeric_limits<real>::max() };
 			bool res = false;
-			for (auto& vL : contact.m_body_inc.m_body->m_polytope->m_vertices) {
-				auto vW = ITOWP(vL.m_positionL);							//world coordinates
+			for (auto& vL : contact.m_body_inc->m_polytope->m_vertices) {
+				//auto vW = contact.m_tfSpace.incident_to_world_point(vL.m_positionL);							//world coordinates
+				auto vW = contact.m_tfSpace.point_transform(vL.m_positionL, TransformSpace::incident, TransformSpace::world);							//world coordinates
 				if (vW.y <= m_collision_margin) {							//close to the ground?
 					min_depth = std::min(min_depth, vW.y);					//remember smalles y coordinate for calculating bias
 					addContactPoint(contact, vW, glmvec3{ 0,1,0 }, vW.y);	//add the contact point
@@ -1335,8 +1547,8 @@ namespace vpe {
 			int i = -1;
 			for (auto& cp : contact.m_contact_points) {
 				++i;
-				auto vref = contact.m_body_ref.m_body->totalVelocityW(cp.m_positionW);	//Veloity at contact point of reference body
-				auto vinc = contact.m_body_inc.m_body->totalVelocityW(cp.m_positionW);	//Veloity at contact point of incident body
+				auto vref = contact.m_body_ref->totalVelocityW(cp.m_positionW);	//Veloity at contact point of reference body
+				auto vinc = contact.m_body_inc->totalVelocityW(cp.m_positionW);	//Veloity at contact point of incident body
 				auto vrel = vinc - vref;							//Velocity difference
 				auto dN = glm::dot(vrel, contact.m_normalW);		//Closing speed, if negative then there is a collision
 				real f{ 0.0_real }, t0{ 0.0_real }, t1{ 0.0_real };	//The impulses to be calculated
@@ -1354,18 +1566,18 @@ namespace vpe {
 					glmmat3 mc0 = matrixCross3(cp.m_r0W);
 					glmmat3 mc1 = matrixCross3(cp.m_r1W);
 
-					glmmat3 K = -mc1 * contact.m_body_inc.m_body->m_inertia_invW * mc1 - mc0 * contact.m_body_ref.m_body->m_inertia_invW * mc0;
+					glmmat3 K = -mc1 * contact.m_body_inc->m_inertia_invW * mc1 - mc0 * contact.m_body_ref->m_inertia_invW * mc0;
 
 					auto dV = -cp.m_restitution * dN * contact.m_normalW - vrel;
-					auto kn = contact.m_body_ref.m_body->m_mass_inv + contact.m_body_inc.m_body->m_mass_inv + glm::dot(K * contact.m_normalW, contact.m_normalW);
+					auto kn = contact.m_body_ref->m_mass_inv + contact.m_body_inc->m_mass_inv + glm::dot(K * contact.m_normalW, contact.m_normalW);
 					f = (glm::dot(dV, contact.m_normalW) + m_use_vbias * cp.m_vbias) / kn;
 					cp.m_vbias = 0.0_real;
 
-					auto kt0 = contact.m_body_ref.m_body->m_mass_inv + contact.m_body_inc.m_body->m_mass_inv +
+					auto kt0 = contact.m_body_ref->m_mass_inv + contact.m_body_inc->m_mass_inv +
 						glm::dot(K * contact.m_tangentW[0], contact.m_tangentW[0]);
 					t0 = -glm::dot(dV, contact.m_tangentW[0]) / kt0;
 
-					auto kt1 = contact.m_body_ref.m_body->m_mass_inv + contact.m_body_inc.m_body->m_mass_inv +
+					auto kt1 = contact.m_body_ref->m_mass_inv + contact.m_body_inc->m_mass_inv +
 						glm::dot(K * contact.m_tangentW[1], contact.m_tangentW[1]);
 					t1 = -glm::dot(dV, contact.m_tangentW[1]) / kt1;
 				}
@@ -1385,10 +1597,10 @@ namespace vpe {
 
 				auto F = f * contact.m_normalW - dt.x * contact.m_tangentW[0] - dt.y * contact.m_tangentW[1]; //total impulse
 
-				contact.m_body_ref.m_body->m_linear_velocityW += -F * contact.m_body_ref.m_body->m_mass_inv;
-				contact.m_body_ref.m_body->m_angular_velocityW += contact.m_body_ref.m_body->m_inertia_invW * glm::cross(cp.m_r0W, -F);
-				contact.m_body_inc.m_body->m_linear_velocityW += F * contact.m_body_inc.m_body->m_mass_inv;
-				contact.m_body_inc.m_body->m_angular_velocityW += contact.m_body_inc.m_body->m_inertia_invW * glm::cross(cp.m_r1W, F);
+				contact.m_body_ref->m_linear_velocityW += -F * contact.m_body_ref->m_mass_inv;
+				contact.m_body_ref->m_angular_velocityW += contact.m_body_ref->m_inertia_invW * glm::cross(cp.m_r0W, -F);
+				contact.m_body_inc->m_linear_velocityW += F * contact.m_body_inc->m_mass_inv;
+				contact.m_body_inc->m_angular_velocityW += contact.m_body_inc->m_inertia_invW * glm::cross(cp.m_r1W, F);
 			}
 			return res;
 		}
@@ -1456,11 +1668,17 @@ namespace vpe {
 		/// <param name="vertex">A pointer to a vertex, to make sure that axis points away from ref object.</param>
 		/// <returns>Distance between the object. If negative, this is the seperating distance. Also return ref and inc vertex.</returns>
 		SatQuery sat_query(Contact& contact, glmvec3 nR) {
-			auto nW = glm::normalize(RTOWN(nR));
-			Vertex* vertA = contact.m_body_ref.m_body->support(nR);			//find support point in direction n
-			Vertex* vertB = contact.m_body_inc.m_body->support(RTOIN(-nR));	//find support point in direction n
-			real maxA = glm::dot(nW, RTOWP(vertA->m_positionL));					//distance in this direction for ref object
-			real minB = glm::dot(nW, ITOWP(vertB->m_positionL));					//distance in this direction for inc object
+			//auto nW = glm::normalize(contact.m_tfSpace.ref_to_world_normal(nR));
+			auto nW = glm::normalize(contact.m_tfSpace.normal_transform(nR, TransformSpace::reference, TransformSpace::world));
+			Vertex* vertA = contact.m_body_ref->support(nR);			//find support point in direction n
+		//	Vertex* vertB = contact.m_body_inc->support(contact.m_tfSpace.ref_to_incident_normal(-nR));	//find support point in direction n
+		//	real maxA = glm::dot(nW, contact.m_tfSpace.ref_to_world_point(vertA->m_positionL));					//distance in this direction for ref object
+		//	real minB = glm::dot(nW, contact.m_tfSpace.incident_to_world_point(vertB->m_positionL));					//distance in this direction for inc object
+
+			Vertex* vertB = contact.m_body_inc->support(contact.m_tfSpace.normal_transform(-nR, TransformSpace::reference, TransformSpace::incident));	//find support point in direction n
+			real maxA = glm::dot(nW, contact.m_tfSpace.point_transform(vertA->m_positionL, TransformSpace::reference, TransformSpace::world));					//distance in this direction for ref object
+			real minB = glm::dot(nW, contact.m_tfSpace.point_transform(vertB->m_positionL, TransformSpace::incident, TransformSpace::world));					//distance in this direction for inc object
+
 			if (minB - maxA > m_collision_margin) contact.m_separating_axisW = nW;	//Remmber separating axis
 			return { minB - maxA, vertA, vertB };	//return distance and reference and incident vertex
 		}
@@ -1473,24 +1691,23 @@ namespace vpe {
 		/// http://media.steampowered.com/apps/valve/2015/DirkGregorius_Contacts.pdf
 		/// 
 		bool SAT(Contact& contact) {
-			contact.m_body_ref.m_to_other = contact.m_body_inc.m_body->m_model_inv * contact.m_body_ref.m_body->m_model; //transform to bring space A to space B
-			contact.m_body_ref.m_to_other_it = glm::transpose(glm::inverse(glmmat3{ contact.m_body_ref.m_to_other }));	//transform for a normal vector
-			contact.m_body_inc.m_to_other = contact.m_body_ref.m_body->m_model_inv * contact.m_body_inc.m_body->m_model; //transform to bring space B to space A
-			contact.m_body_inc.m_to_other_it = glm::transpose(glm::inverse(glmmat3{ contact.m_body_inc.m_to_other }));	//transform for a normal vector
+			// Maybe todo: This should not be needed if the bodies are not active?
+			contact.m_tfSpace.updateMatrices(m_loop);
 
 			if (contact.m_separating_axisW != glmvec3{ 0,0,0 } &&	//try old separating axis
-				sat_query(contact, WTORN(contact.m_separating_axisW)).m_separation > m_collision_margin) {
+			//	sat_query(contact, contact.m_tfSpace.world_to_ref_normal(contact.m_separating_axisW)).m_separation > m_collision_margin) {
+				sat_query(contact, contact.m_tfSpace.normal_transform(contact.m_separating_axisW, TransformSpace::world, TransformSpace::reference)).m_separation > m_collision_margin) {
 				return false;
 			}
 
 			FaceQuery fq0 = queryFaceDirections(contact);			//Query all normal vectors of faces of first body
 			if (fq0.m_separation > m_collision_margin) { return false; };	//found a separating axis with face normal
 
-			std::swap(contact.m_body_ref, contact.m_body_inc);		//body 0 is the reference body having the reference face
+			contact.swapBodies();		//body 0 is the reference body having the reference face
 			FaceQuery fq1 = queryFaceDirections(contact);			//Query all normal vectors of faces of second body
 			if (fq1.m_separation > m_collision_margin) { return false; };	//found a separating axis with face normal
 
-			std::swap(contact.m_body_ref, contact.m_body_inc);		//prevent flip flopping
+			contact.swapBodies();			//prevent flip flopping
 			EdgeQuery eq = queryEdgeDirections(contact);			//Query cross product of edge pairs from body 0 and 1	
 			if (eq.m_separation > m_collision_margin) { return false; }	//found a separating axis with edge-edge normal
 
@@ -1498,7 +1715,7 @@ namespace vpe {
 			if (fq0.m_separation >= eq.m_separation * 1.001_real || fq1.m_separation >= eq.m_separation * 1.001_real) {	//max separation is a face-vertex contact
 				if (fq0.m_separation >= fq1.m_separation) { createFaceContact(contact, fq0); }
 				else {
-					std::swap(contact.m_body_ref, contact.m_body_inc);	//body 0 is the reference body having the reference face
+					contact.swapBodies();		//body 0 is the reference body having the reference face
 					createFaceContact(contact, fq1);
 				}
 			}
@@ -1521,7 +1738,7 @@ namespace vpe {
 				if (sat.m_separation > result.m_separation) result = { sat.m_separation, &face, sat.m_vertB }; //remember max distance
 				return sat.m_separation > m_collision_margin;	//if distance positive, stop - we found a separating axis
 			};
-			auto face = std::ranges::find_if(contact.m_body_ref.m_body->m_polytope->m_faces, sat);
+			auto face = std::ranges::find_if(contact.m_body_ref->m_polytope->m_faces, sat);
 			return result;
 		}
 
@@ -1538,16 +1755,18 @@ namespace vpe {
 		EdgeQuery queryEdgeDirections(Contact& contact) {
 			EdgeQuery result{ -std::numeric_limits<real>::max(), nullptr, nullptr };
 
-			for (auto& edgeA : contact.m_body_ref.m_body->m_polytope->m_edges) {	//loop over all edge-edge pairs
-				for (auto& edgeB : contact.m_body_inc.m_body->m_polytope->m_edges) {
-					glmvec3 n = glm::cross(edgeA.m_edgeL, ITORV(edgeB.m_edgeL));	//axis n is cross product of both edges
+			for (auto& edgeA : contact.m_body_ref->m_polytope->m_edges) {	//loop over all edge-edge pairs
+				for (auto& edgeB : contact.m_body_inc->m_polytope->m_edges) {
+				//	glmvec3 n = glm::cross(edgeA.m_edgeL, contact.m_tfSpace.incident_to_ref_vec(edgeB.m_edgeL));	//axis n is cross product of both edges
+					glmvec3 n = glm::cross(edgeA.m_edgeL, contact.m_tfSpace.vector_transform(edgeB.m_edgeL, TransformSpace::incident, TransformSpace::reference));	//axis n is cross product of both edges
 					if (n == glmvec3{ 0,0,0 }) continue;
 					if (glm::dot(n, edgeA.m_first_vertexL.m_positionL) < 0)	n = -n;		//n must be oriented away from center of A								
 
 					auto sat = sat_query(contact, n);		//Try normal to this edge-edge pair
 					if (sat.m_separation > m_collision_margin) return { sat.m_separation, &edgeA, &edgeB };	//if distance positive, stop - we found a separating axis
 
-					auto distance2 = glm::dot(n, ITORP(edgeB.m_first_vertexL.m_positionL) - sat.m_vertA->m_positionL);	//above does not depend on location - could find an adge on the other side
+					//auto distance2 = glm::dot(n, contact.m_tfSpace.incident_to_ref_point(edgeB.m_first_vertexL.m_positionL) - sat.m_vertA->m_positionL);	
+					auto distance2 = glm::dot(n, contact.m_tfSpace.point_transform(edgeB.m_first_vertexL.m_positionL, TransformSpace::incident, TransformSpace::reference) - sat.m_vertA->m_positionL); //above does not depend on location - could find an adge on the other 
 					if (distance2 <= m_collision_margin && sat.m_separation > result.m_separation) {
 						result = { sat.m_separation, &edgeA, &edgeB, n };	//remember max of negative distances
 					}
@@ -1565,7 +1784,8 @@ namespace vpe {
 		/// <param name="contact">The contact between 2 bodies.</param>
 		/// <param name="fq">Result of face query.</param>
 		void createFaceContact(Contact& contact, FaceQuery& fq) {
-			glmvec3 An = glm::normalize(-RTOIN(fq.m_face_ref->m_normalL)); //transform normal vector of ref face to inc body
+		//	glmvec3 An = glm::normalize(-contact.m_tfSpace.ref_to_incident_normal(fq.m_face_ref->m_normalL)); //transform normal vector of ref face to inc body
+			glmvec3 An = glm::normalize(-contact.m_tfSpace.normal_transform(fq.m_face_ref->m_normalL, TransformSpace::reference, TransformSpace::incident)); //transform normal vector of ref face to inc body
 			Face* inc_face = maxFaceAlignment(An, fq.m_vertex_inc->m_vertex_face_ptrs);	//Find best incident face
 			real sep = clipFaceFace(contact, fq.m_face_ref, inc_face);					//Project and clip it against reference face
 			positionBias(fq.m_separation, sep, fq.m_face_ref->m_normalL, contact);		//Add position bias if necessary
@@ -1583,7 +1803,8 @@ namespace vpe {
 		real clipFaceFace(Contact& contact, Face* face_ref, Face* face_inc) {
 			std::vector<glmvec2> points;						//2D points holding the projected contact points				
 			for (auto* vertex : face_inc->m_face_vertex_ptrs) {	//add face points of B's face
-				auto pT = ITORTP(vertex->m_positionL);		//ransform to A's tangent space
+			//	auto pT = contact.m_tfSpace.incident_to_ref_tangent_point(vertex->m_positionL, face_ref);		//ransform to A's tangent space
+				auto pT = contact.m_tfSpace.point_tangent_transform(vertex->m_positionL, face_ref, face_inc, TransformSpace::incident, TransformSpace::reference_tangent);		//ransform to A's tangent space
 				points.emplace_back(pT.x, pT.z);				//add as 2D point
 			}
 			std::vector<glmvec2> newPolygon;
@@ -1615,14 +1836,19 @@ namespace vpe {
 			real min = 0.0_real;
 			for (auto& p2D : newPolygon) {					//Go through all clip points
 				auto p = glmvec3{ p2D.x, 0.0_real, p2D.y }; //cannot put comma into macro 
-				glmvec3 posRW = RTTOWP(p);					//Bring them to world coordinates
-				glmvec3 posIT = WTOTIP(posRW);				//Bring them to the tangent space of the incident face
+			//	glmvec3 posRW = contact.m_tfSpace.ref_tangent_to_world_point(p, face_ref);					//Bring them to world coordinates
+				glmvec3 posRW = contact.m_tfSpace.point_tangent_transform(p, face_ref, face_inc, TransformSpace::reference_tangent, TransformSpace::world);					//Bring them to world coordinates
+			//	glmvec3 posIT = contact.m_tfSpace.world_to_incident_tangent_point(posRW, face_inc);				//Bring them to the tangent space of the incident face
+				glmvec3 posIT = contact.m_tfSpace.point_tangent_transform(posRW, face_ref, face_inc, TransformSpace::world, TransformSpace::incident_tangent);				//Bring them to the tangent space of the incident face
 				posIT.y = 0.0_real;							//Project to incident face
-				glmvec3 posIW = ITTOWP(posIT);			//Bring back to world coordinates
-				auto dist = glm::dot(posIW - posRW, RTOWN(face_ref->m_normalL));	//Distance between the two points in world coordinates
+			//	glmvec3 posIW = contact.m_tfSpace.incident_tangent_to_world_point(posIT, face_inc);			//Bring back to world coordinates
+				glmvec3 posIW = contact.m_tfSpace.point_tangent_transform(posIT, face_ref, face_inc, TransformSpace::incident_tangent, TransformSpace::world);			//Bring back to world coordinates
+			//	auto dist = glm::dot(posIW - posRW, contact.m_tfSpace.ref_to_world_normal(face_ref->m_normalL));	//Distance between the two points in world coordinates
+				auto dist = glm::dot(posIW - posRW, contact.m_tfSpace.normal_transform(face_ref->m_normalL, TransformSpace::reference, TransformSpace::world));	//Distance between the two points in world coordinates
 				if (dist < m_collision_margin) {			//If close enough the touch
 					min = std::min(min, dist);				//Remember the minimum distance
-					addContactPoint(contact, posRW, RTOWN(face_ref->m_normalL), dist);
+				//	addContactPoint(contact, posRW, contact.m_tfSpace.ref_to_world_normal(face_ref->m_normalL), dist);
+					addContactPoint(contact, posRW, contact.m_tfSpace.normal_transform(face_ref->m_normalL, TransformSpace::reference, TransformSpace::world), dist);
 				}
 			}
 			return min;
@@ -1636,12 +1862,13 @@ namespace vpe {
 		/// <param name="eq">Result of edge query.</param>
 		void createEdgeContact(Contact& contact, EdgeQuery& eq) {
 			Face* ref_face = maxFaceAlignment(eq.m_normalL, eq.m_edge_ref->m_edge_face_ptrs, fabs);	//face of A best aligned with the contact normal
-			Face* inc_face = maxFaceAlignment(-RTOIN(eq.m_normalL), eq.m_edge_inc->m_edge_face_ptrs, fabs);	//face of B best aligned with the contact normal
+		//	Face* inc_face = maxFaceAlignment(-contact.m_tfSpace.ref_to_incident_normal(eq.m_normalL), eq.m_edge_inc->m_edge_face_ptrs, fabs);	//face of B best aligned with the contact normal
+			Face* inc_face = maxFaceAlignment(-contact.m_tfSpace.normal_transform(eq.m_normalL, TransformSpace::reference, TransformSpace::incident), eq.m_edge_inc->m_edge_face_ptrs, fabs);	//face of B best aligned with the contact normal
 
 			real dp_ref = fabs(glm::dot(eq.m_normalL, ref_face->m_normalL));	//Use the better aligned face as reference face.
 			real dp_inc = fabs(glm::dot(eq.m_normalL, inc_face->m_normalL));
 			if (dp_inc > dp_ref) {
-				std::swap(contact.m_body_ref, contact.m_body_inc);	//Use incident face as reference face -> swap positions
+				contact.swapBodies();		//Use incident face as reference face -> swap positions
 				std::swap(ref_face, inc_face);
 				std::swap(eq.m_edge_ref, eq.m_edge_inc);
 			}
@@ -3396,6 +3623,7 @@ namespace vpe {
 
 //-------------------------------------------------------------------------------------------------------
 //Geometry functions
+
 
 namespace geometry {
 
