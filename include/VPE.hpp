@@ -668,16 +668,23 @@ namespace vpe {
 
 		// Todo:  Write test cases with original macros!
 
+		/// <summary>
+		/// This class provides functionality for transforming a vector/point/normal between the coordinates systems of two bodies.
+		/// This is mainly used in collision handling, so the first body is called reference body and the second one is called incident body.
+		/// The naming convention is arbitrary though, this class can be used from anywhere if needed
+		/// </summary>
 		struct TransformSpace {
-			// First entry is reference body, second one is incident
-			std::array<std::shared_ptr<Body>, 2> m_bodies;
-			std::array<glmmat4, 2> m_matrices;
-			std::array<glmmat3, 2> m_matrices_it;
+			std::array<std::shared_ptr<Body>, 2> m_bodies;	// First entry is reference body, second one is incident
+			std::array<glmmat4, 2> m_matrices;				// Matrices for going from CS of body A to body B (e.g. first entry is reference -> incident)
+			std::array<glmmat3, 2> m_matrices_it;			// Inverse transpose of above matrices for normals
 
 			TransformSpace(std::shared_ptr<Body> ref, std::shared_ptr<Body> inc) : m_bodies{ {ref, inc} } {
 				updateMatrices(0); // We always want to compute values here, thus we pass 0 as a loop value
 			}
 
+			/// <summary>
+			/// Represents the coordinate systems / space to be used in the transformations
+			/// </summary>
 			enum tf_space_t {
 				reference			= 1,
 				incident			= 2,
@@ -686,9 +693,21 @@ namespace vpe {
 				incident_tangent	= incident | tangent,
 				reference_tangent	= reference | tangent
 			};
+
+			/// <summary>
+			/// Swaps reference and incident bodies and matrices
+			/// </summary>
+			void swapBodies() {
+				std::swap(m_bodies[0], m_bodies[1]);
+				std::swap(m_matrices[0], m_matrices[1]);
+				std::swap(m_matrices_it[0], m_matrices_it[1]);
+			}
  
+			/// <summary>
+			/// Recomputes the matrices needed for the transformations. Matrices are only updated if one of the two involved bodies was active in the previous loop iteration
+			/// </summary>
+			/// <param name="current_loop"></param>
 			void updateMatrices(const uint64_t& current_loop) {
-				// Only update matrices if one of the involved bodies have changed position/orientation, i.e. if they were active in the previous loop
 				if (m_bodies[0]->m_loop_last_active + 1 >= current_loop || m_bodies[1]->m_loop_last_active + 1 >= current_loop) {
 					m_matrices[0] = m_bodies[1]->m_model_inv * m_bodies[0]->m_model; //transform to bring space A to space B
 					m_matrices_it[0] = glm::transpose(glm::inverse(glmmat3{ m_matrices[0]}));	//transform for a normal vector
@@ -697,6 +716,13 @@ namespace vpe {
 				}
 			}
 
+			/// <summary>
+			/// Transforms given point in space "from" to target space "to"
+			/// </summary>
+			/// <param name="p">Point to transform</param>
+			/// <param name="from">Original coordinate space</param>
+			/// <param name="to">Target coordinate space</param>
+			/// <returns>p transformed to target space</returns>
 			glmvec3 point_transform(const glmvec4& p, tf_space_t from, tf_space_t to) const {
 				// Converting into the same space makes no sense here
 				assert(from != to);
@@ -712,14 +738,35 @@ namespace vpe {
 				}
 			}
 
+			/// <summary>
+			/// Overload for glmvec3 points
+			/// </summary>
+			/// <param name="p">Point to transform</param>
+			/// <param name="from">Original coordinate space</param>
+			/// <param name="to">Target coordinate space</param>
+			/// <returns>p transformed to target space</returns>
 			glmvec3 point_transform(const glmvec3& p, tf_space_t from, tf_space_t to) const {
 				return point_transform(glmvec4{ p, 1.0_real }, from, to);
 			}
 
+			/// <summary>
+			/// Transforms given vector v in space "from" to target space "to"
+			/// </summary>
+			/// <param name="p">Vector to transform</param>
+			/// <param name="from">Original coordinate space</param>
+			/// <param name="to">Target coordinate space</param>
+			/// <returns>Transformed vector in target space</returns>
 			glmvec3 vector_transform(const glmvec3& v, tf_space_t from, tf_space_t to) const {
 				return point_transform(glmvec4{v, 0.0_real}, from, to );
 			}
 
+			/// <summary>
+			/// Transforms given normal n in space "from" to target space "to"
+			/// </summary>
+			/// <param name="p">Normal to transform</param>
+			/// <param name="from">Original coordinate space</param>
+			/// <param name="to">Target coordinate space</param>
+			/// <returns>Transformed normal in target space</returns>
 			glmvec3 normal_transform(const glmvec3& n, tf_space_t from, tf_space_t to) const {
 				// Converting into the same space makes no sense here
 				assert(from != to);
@@ -735,6 +782,16 @@ namespace vpe {
 				}
 			}
 
+			/// <summary>
+			/// Transforms point p from space "from" to target space "to". 
+			/// This function allows transformations from/to tangent space of a given face for the ref/incident object
+			/// </summary>
+			/// <param name="p">Point to transform</param>
+			/// <param name="face_ref">Pointer to face for the reference body (can be nullptr if not needed)</param>
+			/// <param name="face_incident">Pointer to face for the incident body (can be nullptr if not needed)</param>
+			/// <param name="from">Original coordinate space</param>
+			/// <param name="to">Target coordinate space</param>
+			/// <returns>Transformed point in target space</returns>
 			glmvec3 point_tangent_transform(const glmvec3& p, Face* face_ref, Face* face_incident, tf_space_t from, tf_space_t to) const {
 				// Tangent space can't be combined with world space
 				assert(!((from & tf_space_t::tangent) && (from & tf_space_t::world)) && !((to & tf_space_t::tangent) && (to & tf_space_t::world)));
@@ -761,6 +818,7 @@ namespace vpe {
 				return _p;
 			}
 
+/*
 			void cmp(glmvec3 v1, glmvec3 v2, std::string pr) const {
 				if (!glm::all(glm::epsilonEqual(v1, v2, 0.0001f))) {
 					
@@ -769,13 +827,7 @@ namespace vpe {
 				}
 			}
 
-			void swapBodies() {
-				std::swap(m_bodies[0], m_bodies[1]);
-				std::swap(m_matrices[0], m_matrices[1]);
-				std::swap(m_matrices_it[0], m_matrices_it[1]);
-			}
-
-			/*
+			
 			glmvec3 incident_to_ref_point(const glmvec3& v) const {
 				auto test = this->point_transform(v, TransformSpace::incident, TransformSpace::reference);
 				cmp(test, glmvec3{ m_body_inc.m_to_other * glmvec4{v, 1.0_real} }, "1");
