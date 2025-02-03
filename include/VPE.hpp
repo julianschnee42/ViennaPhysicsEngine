@@ -702,7 +702,6 @@ namespace vpe {
 				assert(from != to);
 
 				if (from & tf_space_t::world) {
-					// Remove tangent flag if it's set
 					return m_bodies[(to & (~tf_space_t::tangent)) - 1]->m_model_inv * p;
 				}
 				else if (to & tf_space_t::world) {
@@ -721,16 +720,18 @@ namespace vpe {
 				return point_transform(glmvec4{v, 0.0_real}, from, to );
 			}
 
-			// Todo:: Include this in above or remove tangent flag
 			glmvec3 normal_transform(const glmvec3& n, tf_space_t from, tf_space_t to) const {
+				// Converting into the same space makes no sense here
+				assert(from != to);
+
 				if (from & tf_space_t::world) {
-					return glmmat3{ m_bodies[static_cast<int>(to) - 1]->m_model_inv } * n;
+					return glmmat3{ m_bodies[(to & (~tf_space_t::tangent)) - 1]->m_model_inv } * n;
 				}
 				else if (to & tf_space_t::world) {
-					return glmmat3{ m_bodies[static_cast<int>(from) - 1]->m_model_it } * n;
+					return glmmat3{ m_bodies[(from & (~tf_space_t::tangent)) - 1]->m_model_it } * n;
 				}
 				else {
-					return glmmat3{ m_matrices_it[static_cast<int>(from) - 1] } * n;
+					return glmmat3{ m_matrices_it[(from & (~tf_space_t::tangent)) - 1] } * n;
 				}
 			}
 
